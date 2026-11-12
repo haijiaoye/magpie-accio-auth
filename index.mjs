@@ -298,7 +298,14 @@ function buildSpaceMethod({ channel, provider, displayName, spaceLabel, authSet,
  * ⚠️ 入口模块里**每个函数导出都是一条供应商**，所以下面只导出两个
  *    `makePlugin()` 的成品，别把工厂本身导出。
  */
-function makePlugin({ provider, displayName, channel, importLegacy, spaceLabel = `切换 ${displayName} 空间（个人 / 商户）` }) {
+function makePlugin({
+  provider,
+  displayName,
+  channel,
+  importLegacy,
+  seedFrom,
+  spaceLabel = `切换 ${displayName} 空间（个人 / 商户）`,
+}) {
   const BASE_URL = `https://${provider}.invalid`
   const stripOwn = (model) => stripProvider(model, provider)
 
@@ -332,6 +339,31 @@ function makePlugin({ provider, displayName, channel, importLegacy, spaceLabel =
         }
       } catch (error) {
         debugLog(`legacy import failed: ${error?.message ?? error}`)
+      }
+    }
+
+    // 国内版与国际版是**同一个 Accio 账号**（同一网关、同一套 token），只是
+    // 请求头与模型目录不同。所以国际版还没有账号时直接复用国内版的登录态 ——
+    // 让用户为同一个账号登录两次没有意义。
+    if (seedFrom !== undefined) {
+      try {
+        if (readSlots(provider).length === 0) {
+          const source = primarySlot(seedFrom)
+          const credential = source === undefined ? undefined : credentialOf(source.auth)
+          if (credential !== undefined) {
+            await authSet?.({
+              path: { id: provider },
+              body: authOf(credential, channel.id, {
+                accountId: typeof source.auth.accountId === 'string' && source.auth.accountId !== ''
+                  ? source.auth.accountId
+                  : displayName,
+              }),
+            })
+            toast(`${displayName}：已复用 ${seedFrom} 的登录`)
+          }
+        }
+      } catch (error) {
+        debugLog(`seed from ${seedFrom} failed: ${error?.message ?? error}`)
       }
     }
 
@@ -515,6 +547,7 @@ export const AccioGlobalPlugin = makePlugin({
   displayName: 'Accio 国际版',
   channel: accioGlobalChannel,
   importLegacy: false,
+  seedFrom: PROVIDER,
 })
 
 export default AccioPlugin

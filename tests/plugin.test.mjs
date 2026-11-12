@@ -190,6 +190,34 @@ test('国际版不会把 hub-accio 的国内登录导入进来', async () => {
   assert.equal(saved.length, 0)
 })
 
+test('国际版复用国内版登录态（同一账号，不必登录两次）', async () => {
+  authFile({
+    accio: {
+      type: 'oauth',
+      channel: 'accio',
+      access: credential.access_token,
+      refresh: credential.refresh_token,
+      expires: credential.expires_at,
+      team_id: credential.team_id,
+      team_name: credential.team_name,
+      accountId: 'Accio (阿里)',
+    },
+  })
+  const saved = []
+  await AccioGlobalPlugin({
+    client: {
+      auth: { set: async (opts) => { saved.push(opts); return { data: true } } },
+      tui: { showToast: async () => ({ data: true }) },
+      app: { log: async () => ({ data: true }) },
+    },
+  })
+  assert.equal(saved.length, 1)
+  assert.equal(saved[0].path.id, PROVIDER_GLOBAL)
+  assert.equal(saved[0].body.channel, 'accio-global')
+  assert.equal(saved[0].body.access, credential.access_token)
+  assert.equal(saved[0].body.team_id, credential.team_id)
+})
+
 test('两条供应商的兜底目录互不混入对方的模型', async () => {
   const cn = await hook()
   const global = await globalHook()
