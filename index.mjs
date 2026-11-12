@@ -354,20 +354,20 @@ function makePlugin({
     // 让用户为同一个账号登录两次没有意义。
     if (seedFrom !== undefined) {
       try {
-        if (readSlots(provider).length === 0) {
-          const source = primarySlot(seedFrom)
-          const credential = source === undefined ? undefined : credentialOf(source.auth)
-          if (credential !== undefined) {
-            await authSet?.({
-              path: { id: provider },
-              body: authOf(credential, channel.id, {
-                accountId: typeof source.auth.accountId === 'string' && source.auth.accountId !== ''
-                  ? source.auth.accountId
-                  : displayName,
-              }, channel.site),
-            })
-            toast(`${displayName}：已复用 ${seedFrom} 的登录`)
-          }
+        const own = primarySlot(provider)
+        const source = own ?? primarySlot(seedFrom)
+        const credential = source === undefined ? undefined : credentialOf(source.auth)
+        // 已经记着正确区域就什么都不做；只在「没有账号」或「区域记错了」时写回。
+        if (credential !== undefined && (own === undefined || own.auth.region !== channel.site)) {
+          await authSet?.({
+            path: { id: provider },
+            body: authOf(credential, channel.id, {
+              accountId: typeof source.auth.accountId === 'string' && source.auth.accountId !== ''
+                ? source.auth.accountId
+                : displayName,
+            }, channel.site),
+          })
+          if (own === undefined) toast(`${displayName}：已复用 ${seedFrom} 的登录`)
         }
       } catch (error) {
         debugLog(`seed from ${seedFrom} failed: ${error?.message ?? error}`)
