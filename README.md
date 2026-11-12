@@ -9,7 +9,8 @@
 | `accio` · Accio (阿里) | `www.accio-ai.com`（国内版） | GLM、DeepSeek、Kimi、Qwen 等 15 个 |
 | `accio-global` · Accio 国际版 | `www.accio.com`（国际版） | Claude、GPT、Gemini、Grok 等 27 个 |
 
-两条供应商各自登录、各自开关、各自额度，互不影响；用哪条就在哪条下面登录。
+两条供应商各自开关、各自额度，互不影响。**同一个 Accio 账号只登录一次即可**：
+国内版登录后，国际版会自动复用那份登录态（同一网关、同一套 token）。
 
 ## 能做什么
 
@@ -34,6 +35,7 @@ magpie plugin add github:haijiaoye/magpie-accio-auth
 ## 使用
 
 1. magpie 左侧 **供应商** → 选 **Accio (阿里)**（国内）或 **Accio 国际版** → 登录。
+   先登录其中一条即可，另一条会自动复用（也可以各自单独登录成不同账号）。
 2. 浏览器里完成 Accio 登录，回到 magpie 即已登录。
 3. 需要切到商户空间时：
    - 界面：供应商 → 对应 Accio → **添加另一个账号** →
