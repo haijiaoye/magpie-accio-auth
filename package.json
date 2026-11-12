@@ -1,7 +1,7 @@
 {
   "name": "magpie-accio-auth",
-  "version": "0.1.0",
-  "description": "Accio (阿里 Accio Work) as a standalone magpie / OpenCode provider: browser sign-in, real quota, and personal / business (team) space switching.",
+  "version": "0.2.0",
+  "description": "Accio (Alibaba Accio Work) as standalone magpie / OpenCode providers: CN (www.accio-ai.com) and Global (www.accio.com), with browser sign-in, real quota, and personal / business (team) space switching.",
   "type": "module",
   "main": "./index.mjs",
   "exports": {
@@ -19,6 +19,7 @@
     "opencode",
     "opencode-plugin",
     "accio",
+    "accio-global",
     "alibaba"
   ],
   "license": "MIT",
@@ -29,11 +30,11 @@
     "test": "node --test tests/*.test.mjs"
   },
   "magpie": {
-    "name": "Accio (阿里)",
+    "name": "Accio",
     "maxConcurrency": 4,
     "summary": {
-      "zh": "接入 Accio（阿里 Accio Work）：浏览器登录、真实额度，并可在个人空间与商户空间之间切换。",
-      "en": "Accio (Alibaba Accio Work) with browser sign-in, real quota, and personal / business space switching."
+      "zh": "接入 Accio（阿里 Accio Work）国内版与国际版：浏览器登录、真实额度，并可在个人空间与商户空间之间切换。",
+      "en": "Accio (Alibaba Accio Work), CN and Global, with browser sign-in, real quota, and personal / business space switching."
     },
     "icon": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAABQ0lEQVR42u2bXQ6DMAyDG2unHecp12VPk6ZpQ0BL4zTuOzRuvv5A41LUcje78tD2LButoPWcJptBdMtgYFbxR+O2GYWfoQEZxO/pQQbxe7pQkjdkyf4/fcgk/pdOTQH3COrGMQBZ8P/WC4rsO1KgNYBm7jtRIAKoVn4HCkQA3b4/mAIRQHnqG0iBCKA98w+iQARQf/ENoEAEuGd/MVcKRABF9h0pEAE0c9+JAhFAtfI7UCAC6Pb9wRSIAKrsO1AAVYmVTldjHv/1F2sum9EaEPqGt0O/IiD6/X5r/yIgdPY7xPFg3qa4P4crWUXNxXgQIvt3vK9pACppPdWFuBAi+ze+F6edFpW8mu5gfG+9lrFU9nMAdBBqMRzN4B5Bq+squnVGU6CH9y6ycQq9DIhRXWM2s2/wSCJxhx01knM0vXc4fXsBdLiBViam7pwAAAAASUVORK5CYII="
   },

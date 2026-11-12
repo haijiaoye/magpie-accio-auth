@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, test } from 'node:test'
 
-import { AccioPlugin, PROVIDER } from '../index.mjs'
+import { AccioGlobalPlugin, AccioPlugin, PROVIDER, PROVIDER_GLOBAL } from '../index.mjs'
 
 let dir
 
@@ -30,6 +30,14 @@ const hook = async () => {
   })
   return plugin
 }
+
+const globalHook = async () => AccioGlobalPlugin({
+  client: {
+    auth: { set: async () => ({ data: true }) },
+    tui: { showToast: async () => ({ data: true }) },
+    app: { log: async () => ({ data: true }) },
+  },
+})
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'magpie-accio-'))
@@ -154,4 +162,60 @@ test('空间切换会把商户空间写进凭据', async () => {
   assert.equal(result.refresh, credential.refresh_token)
   assert.equal(result.expires, credential.expires_at)
   assert.equal(result.accountId, 'Accio (阿里)')
+})
+
+test('国际版是独立供应商，登录与空间切换入口都在它自己名下', async () => {
+  const plugin = await globalHook()
+  assert.equal(plugin.auth.provider, PROVIDER_GLOBAL)
+  const cfg = {}
+  await plugin.config(cfg)
+  assert.deepEqual(Object.keys(cfg.provider), [PROVIDER_GLOBAL])
+  assert.equal(cfg.provider[PROVIDER_GLOBAL].name, 'Accio 国际版')
+  assert.deepEqual(plugin.auth.methods.map((m) => m.label), [
+    '登录 Accio 国际版',
+    '切换 Accio 国际版 空间（个人 / 商户）',
+  ])
+})
+
+test('国际版不会把 hub-accio 的国内登录导入进来', async () => {
+  authFile({ 'hub-accio': { type: 'success', channel: 'accio', access_token: 'a', refresh_token: 'r' } })
+  const saved = []
+  await AccioGlobalPlugin({
+    client: {
+      auth: { set: async (opts) => { saved.push(opts); return { data: true } } },
+      tui: { showToast: async () => ({ data: true }) },
+      app: { log: async () => ({ data: true }) },
+    },
+  })
+  assert.equal(saved.length, 0)
+})
+
+test('两条供应商的兜底目录互不混入对方的模型', async () => {
+  const cn = await hook()
+  const global = await globalHook()
+  const cnModels = await cn.provider.models({ models: {} }, {})
+  const globalModels = await global.provider.models({ models: {} }, {})
+
+  // 国内版有 GLM / DeepSeek / Kimi，没有 Claude / GPT / Gemini
+  assert.ok('glm-5-3' in cnModels)
+  assert.ok('deepseek-v4-pro' in cnModels)
+  assert.ok(!('claude-sonnet-5' in cnModels))
+  assert.ok(!('gpt-5-6-luna' in cnModels))
+
+  // 国际版反之
+  assert.ok('claude-sonnet-5' in globalModels)
+  assert.ok('gpt-5-6-luna' in globalModels)
+  assert.ok('gemini-3-5-flash' in globalModels)
+  assert.ok(!('glm-5-3' in globalModels))
+  assert.ok(!('deepseek-v4-pro' in globalModels))
+})
+
+test('国际版未登录时同样返回 401', async () => {
+  const plugin = await globalHook()
+  const opts = await plugin.auth.loader(async () => undefined)
+  const response = await opts.fetch('https://accio-global.invalid/v1/chat/completions', {
+    method: 'POST',
+    body: JSON.stringify({ model: 'accio-global/claude-sonnet-5', messages: [] }),
+  })
+  assert.equal(response.status, 401)
 })

@@ -33,9 +33,23 @@ import { fetchWithRetry } from './transport.mjs'
 export const CHANNEL_ID = 'accio'
 export const DISPLAY_NAME = 'Accio (阿里)'
 
+/**
+ * 国内版 / 国际版**共用同一个网关与账号体系**，只有两处不同（2026-11 实测）：
+ *
+ *  1. 登录站点：国内 `www.accio-ai.com`，国际 `www.accio.com`；
+ *  2. 每个网关请求带 `x-package-region: GLOBAL`（国内不带，或 `CN`）。
+ *
+ * ⚠️ 区域不是「显示偏好」：`/api/llm/config/v2` 在 GLOBAL 下返回的是**另一套
+ *    模型目录**（Claude / GPT / Gemini 共 27 个），国内 15 个；同名模型
+ *    （Qwen 3.8 Max）两边的 `modelCode` **也不一样**。所以区域必须进凭据、
+ *    续期原样保留，且模型 slug→modelCode 的映射要按区域分开存。
+ */
+export const SITE_CN = 'cn'
+export const SITE_GLOBAL = 'global'
+
 const GATEWAY = 'https://phoenix-gw.alibaba.com'
 const LOGIN_BASE_CN = 'https://www.accio-ai.com'
-const LOGIN_BASE_GLOBAL = 'https://zh.accio.com'
+const LOGIN_BASE_GLOBAL = 'https://www.accio.com'
 const TOKEN_EXCHANGE_PATH = '/api/oauth/token'
 const REFRESH_PATH = '/api/auth/refresh_token'
 const LLM_PATH = '/api/adk/llm/generateContent'
@@ -141,9 +155,9 @@ export function buildAuthUrl({ region, redirectUri, state, codeChallenge }) {
     code_challenge_method: 'S256',
     client_id: CLIENT_ID,
     ttid: `ttid_${randomBytes(16).toString('hex')}`,
-    language: 'zh',
+    language: region === SITE_GLOBAL ? 'en' : 'zh',
   })
-  const base = region === 'global' ? LOGIN_BASE_GLOBAL : LOGIN_BASE_CN
+  const base = region === SITE_GLOBAL ? LOGIN_BASE_GLOBAL : LOGIN_BASE_CN
   return `${base}/login?${params.toString()}`
 }
 
@@ -181,7 +195,7 @@ function toCredential(path, data, extra = {}) {
   }
 }
 
-const exchangeCode = async ({ code, codeVerifier, redirectUri }) => {
+const exchangeCode = async ({ code, codeVerifier, redirectUri, region }) => {
   const res = await fetch(`${GATEWAY}${TOKEN_EXCHANGE_PATH}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -189,7 +203,9 @@ const exchangeCode = async ({ code, codeVerifier, redirectUri }) => {
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   })
   const text = await res.text()
-  return toCredential(TOKEN_EXCHANGE_PATH, unwrapEnvelope(TOKEN_EXCHANGE_PATH, res.status, text), { region: 'cn' })
+  return toCredential(TOKEN_EXCHANGE_PATH, unwrapEnvelope(TOKEN_EXCHANGE_PATH, res.status, text), {
+    region: region === SITE_GLOBAL ? SITE_GLOBAL : SITE_CN,
+  })
 }
 
 /** 续期失败的**终态**标记（refresh_token 真的不能用了）。 */
@@ -219,7 +235,9 @@ export async function refreshCredential(current) {
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   })
   const text = await res.text()
-  const next = toCredential(REFRESH_PATH, unwrapEnvelope(REFRESH_PATH, res.status, text), { region: current.region ?? 'cn' })
+  const next = toCredential(REFRESH_PATH, unwrapEnvelope(REFRESH_PATH, res.status, text), {
+    region: current.region === SITE_GLOBAL ? SITE_GLOBAL : SITE_CN,
+  })
   if (typeof current.sgcookie === 'string' && next.sgcookie === undefined) next.sgcookie = current.sgcookie
   // ⚠️ 空间选择是**凭据的一部分**（同一份 token 可读个人或商户空间），
   //    续期只换 token，空间必须原样带过去 —— 否则每次续期都静默退回个人空间。
@@ -295,6 +313,11 @@ const teamQueryOf = (credential) => {
   return teamId === '' ? '' : `&teamId=${encodeURIComponent(teamId)}`
 }
 
+/** 区域（国内 / 国际）头：国际版每个网关请求都要带 `GLOBAL`。 */
+const siteHeadersOf = (credential) => (
+  credential?.region === SITE_GLOBAL ? { 'x-package-region': 'GLOBAL' } : {}
+)
+
 /** 商户空间才带的请求头（个人空间一个都不带）。 */
 const teamHeadersOf = (credential) => (
   typeof credential?.team_id === 'string' && credential.team_id !== ''
@@ -303,7 +326,8 @@ const teamHeadersOf = (credential) => (
 )
 
 /** 起本地回调服务 + 授权 URL，**立刻**返回（beginLogin 契约）。 */
-async function beginLogin(openBrowser) {
+async function beginLogin({ site = SITE_CN, openBrowser } = {}) {
+  const region = site === SITE_GLOBAL ? SITE_GLOBAL : SITE_CN
   const pkce = createPkce()
   const state = randomBytes(32).toString('hex')
   let settleOk, settleFail
@@ -348,7 +372,7 @@ async function beginLogin(openBrowser) {
     // 先回提示页再后台兑换：用户不必盯着转圈的标签页等换 token。
     response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       .end(page('Accio 授权', '授权已收到，可以关闭此页面并返回。'))
-    exchangeCode({ code, codeVerifier: pkce.verifier, redirectUri })
+    exchangeCode({ code, codeVerifier: pkce.verifier, redirectUri, region })
       .then(settleOk)
       .catch((error) => settleFail(error instanceof Error ? error : new Error(String(error))))
   })
@@ -391,7 +415,7 @@ async function beginLogin(openBrowser) {
   })
 
   const redirectUri = `http://127.0.0.1:${port}${CALLBACK_PATH}`
-  const loginUrl = buildAuthUrl({ region: 'cn', redirectUri, state, codeChallenge: pkce.challenge })
+  const loginUrl = buildAuthUrl({ region, redirectUri, state, codeChallenge: pkce.challenge })
   if (openBrowser) openBrowser(loginUrl)
   return {
     url: loginUrl,
@@ -476,21 +500,25 @@ async function catalog(credential) {
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
-        ...typeof credential?.team_id === 'string' && credential.team_id !== ''
-          ? { 'x-team-id': credential.team_id }
-          : {},
+        ...siteHeadersOf(credential),
+        ...teamHeadersOf(credential),
       },
       body: JSON.stringify({ token: credential.access_token }),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     })
     if (res.ok) entries = parseCatalog(await res.json())
   } catch { /* 目录失败回落兜底表 */ }
-  const list = entries !== undefined && entries.length > 0 ? entries : FALLBACK_MODELS
-  // slug（对外 id）与 modelCode 的映射表，chat 时换回
-  modelIndex.length = 0
-  for (const entry of list) modelIndex.push({ slug: slugOf(entry.name) || entry.id, code: entry.id, entry })
+  const isGlobal = credential?.region === SITE_GLOBAL
+  const fallback = isGlobal ? FALLBACK_MODELS_GLOBAL : FALLBACK_MODELS
+  const list = entries !== undefined && entries.length > 0 ? entries : fallback
+  // slug（对外 id）与 modelCode 的映射表，chat 时换回。
+  // ⚠️ 按区域分开存：同名模型（Qwen 3.8 Max）在两边是不同的 modelCode，
+  //    共用一张表会让国内请求发到国际的 code（或反之）。
+  const index = isGlobal ? globalModelIndex : cnModelIndex
+  index.length = 0
+  for (const entry of list) index.push({ slug: slugOf(entry.name) || entry.id, code: entry.id, entry })
   const models = {}
-  for (const { slug, entry } of modelIndex) {
+  for (const { slug, entry } of index) {
     models[slug] = {
       name: entry.multiple !== undefined ? `${entry.name} · x${entry.multiple}` : entry.name,
       limit: {
@@ -531,8 +559,13 @@ function variantsOf(entry) {
 }
 
 /** slug → modelCode（上行必须用 modelCode；查不到原样发，让上游报错）。 */
-const codeOf = (slug) => modelIndex.find((m) => m.slug === slug)?.code ?? slug
-const modelIndex = []
+const codeOf = (slug, credential) => {
+  const index = credential?.region === SITE_GLOBAL ? globalModelIndex : cnModelIndex
+  return index.find((m) => m.slug === slug)?.code ?? slug
+}
+/** 国内 / 国际各一张 slug→modelCode 表（同名模型两边 code 不同）。 */
+const cnModelIndex = []
+const globalModelIndex = []
 
 /**
  * 兜底模型表（DSH 2026-10-12 实测 15 条，倍率升序；slug 由展示名归一）。
@@ -556,6 +589,43 @@ const FALLBACK_MODELS = [
   { id: '1Orbit-Q7hN3xR6cP2m', name: 'Ultimate', contextWindow: 1_000_000, supportsImage: true, multiple: 2.8 },
 ]
 
+/**
+ * 国际版兜底表（2026-11-12 实测 27 条，倍率升序）。
+ *
+ * ⚠️ 与国内表**不是超集关系**：国际版没有 GLM / DeepSeek / Kimi，国内版也没有
+ *    Claude / GPT / Gemini。别把两张表合并成一张 —— 目录失败时会「多出」对方
+ *    才有的模型，请求打过去必然失败。
+ */
+const FALLBACK_MODELS_GLOBAL = [
+  { id: '1Drift-F8hS3mK7pL6I', name: 'Qwen 3.8 Flash', contextWindow: 1_000_000, supportsImage: true, multiple: 0.003 },
+  { id: '1Orbit-H55aN8xR6cP2m', name: 'Claude Haiku 5.5', contextWindow: 1_000_000, supportsImage: true, multiple: 0.03 },
+  { id: '1Helix-G6Lu8nK4qR2m', name: 'GPT 6 Luna', contextWindow: 1_050_000, supportsImage: true, multiple: 0.04 },
+  { id: '1Zenith-M27hS2SR5xQ2p', name: 'MiniMax M3', contextWindow: 1_000_000, supportsImage: true, multiple: 0.08 },
+  { id: '1Helix-3EjR3WN1dY6s', name: 'GPT 5.6 Luna', contextWindow: 1_050_000, supportsImage: true, multiple: 0.09 },
+  { id: '1Nexus-R36W8qJ5vB6h', name: 'Gemini 3 Flash', contextWindow: 1_000_000, supportsImage: true, multiple: 0.13 },
+  { id: '1Nexus-R7GF8qJ6vd8p', name: 'Gemini 3.7 Flash', contextWindow: 1_000_000, supportsImage: true, multiple: 0.25 },
+  { id: '1Nexus-R8HF9qK7we1s', name: 'Gemini 3.8 Flash', contextWindow: 1_000_000, supportsImage: true, multiple: 0.25 },
+  { id: '1Orbit-I93V4tK8bW1f', name: 'Claude Haiku 4.5', contextWindow: 200_000, supportsImage: true, multiple: 0.35 },
+  { id: '1Nexus-R3wF8qJ5vc7o', name: 'Gemini 3.5 Flash', contextWindow: 1_000_000, supportsImage: true, multiple: 0.4 },
+  { id: '1Helix-G46W8nP2qR6m', name: 'Grok 4.6', contextWindow: 500_000, supportsImage: true, multiple: 0.5 },
+  { id: '1Drift-T3T9WWS9a23w', name: 'Qwen 3.8 Max', contextWindow: 1_000_000, supportsImage: true, multiple: 0.56 },
+  { id: '1Helix-G6So7pW3xN9q', name: 'GPT 6 Sol', contextWindow: 1_050_000, supportsImage: true, multiple: 0.7 },
+  { id: '1Orbit-I93F4tK8bW1f', name: 'Claude Sonnet 5', contextWindow: 1_000_000, supportsImage: true, multiple: 0.7 },
+  { id: '1Nexus-utXDaAethymI', name: 'Gemini 4 Argon', contextWindow: 1_048_576, supportsImage: true, multiple: 0.7 },
+  { id: '1Helix-B33T3WN1dY6s', name: 'GPT 5.6 Terra', contextWindow: 1_050_000, supportsImage: true, multiple: 0.88 },
+  { id: '1Orbit-I9eY7YK8bW1f', name: 'Claude Sonnet 4.6', contextWindow: 1_000_000, supportsImage: true, multiple: 1 },
+  { id: '1Orbit-Q55pN8xR6cP2m', name: 'Claude Opus 5.5', contextWindow: 1_000_000, supportsImage: true, multiple: 1.33 },
+  { id: '1Orbit-Q7hN2R6cP2m', name: 'Claude Opus 4.7', contextWindow: 1_000_000, supportsImage: true, multiple: 1.65 },
+  { id: '1Orbit-Q2XN3xR6cP2m', name: 'Claude Opus 4.8', contextWindow: 1_000_000, supportsImage: true, multiple: 1.7 },
+  { id: '1Helix-B3jR8wN1dY6s', name: 'GPT 5.5', contextWindow: 1_050_000, supportsImage: true, multiple: 1.8 },
+  { id: '1Helix-B3jR3WN1dY6s', name: 'GPT 5.6 Sol', contextWindow: 1_050_000, supportsImage: true, multiple: 2.2 },
+  { id: '1Orbit-Q5pN8xR6cP2m', name: 'Claude Opus 5', contextWindow: 1_000_000, supportsImage: true, multiple: 2.8 },
+  { id: '1Orbit-F52W8nP2qR7n', name: 'Claude Fable 5.2', contextWindow: 1_000_000, supportsImage: true, multiple: 2.8 },
+  { id: '1Helix-G6aS8tR2qN7m', name: 'GPT 6 Astra', contextWindow: 1_050_000, supportsImage: true, multiple: 3.5 },
+  { id: '1Orbit-F51W8nP2qR6m', name: 'Claude Fable 5.1', contextWindow: 1_000_000, supportsImage: true, multiple: 3.5 },
+  { id: '1Orbit-Q2XN3dX6cP2m', name: 'Claude Fable 5', contextWindow: 1_000_000, supportsImage: true, multiple: 3.5 },
+]
+
 // ── 请求体构造（buildAccioBody 同口径）──────────────────────────────────
 
 /** 请求头。⚠️ 不带 SecurityGuard 的 pctb-x-*（实测不必需）；token 不放 Authorization。 */
@@ -566,6 +636,7 @@ function accioHeaders(credential) {
     utdid: utdidOf(),
     version: APP_VERSION,
     appKey: APP_KEY,
+    ...siteHeadersOf(credential),
   }
   if (typeof credential?.sgcookie === 'string' && credential.sgcookie !== '') {
     headers.sgcookie = credential.sgcookie
@@ -1009,7 +1080,7 @@ function errorDetail(body) {
  */
 async function chat(credential, { body: openaiBody, signal, renew }) {
   const slug = String(openaiBody?.model ?? '')
-  const wireModel = codeOf(slug)
+  const wireModel = codeOf(slug, credential)
   const { contents, systemInstruction } = serializeMessages(Array.isArray(openaiBody?.messages) ? openaiBody.messages : [])
   const tools = toAccioTools(Array.isArray(openaiBody?.tools) ? openaiBody.tools : [])
   const requestedMax = Number(openaiBody?.max_tokens)
@@ -1145,9 +1216,8 @@ async function entitlementGet(path, credential) {
     method: 'GET',
     headers: {
       Accept: 'application/json',
-      ...typeof credential?.team_id === 'string' && credential.team_id !== ''
-        ? { 'x-team-id': credential.team_id }
-        : {},
+      ...siteHeadersOf(credential),
+      ...teamHeadersOf(credential),
     },
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   })
@@ -1181,7 +1251,7 @@ async function entitlementGet(path, credential) {
  * ⚠️ 它是「额度何时**刷新**」，不是「积分何时**作废**」（Accio 未下发作废时间，
  * 未实测为同一时刻就不写 —— 写了就是编造）。
  */
-async function usage(credential) {
+async function usage(credential, displayName = DISPLAY_NAME) {
   const data = await entitlementGet(SUBSCRIPTION_PATH, credential)
   const entitlement = typeof data?.entitlement === 'object' && data.entitlement !== null
     ? data.entitlement
@@ -1196,9 +1266,9 @@ async function usage(credential) {
   if (entitlement === undefined) {
     // 服务端给了响应但既无桶也无总余额：明说，不退化成 0
     if (typeof data?.remaining !== 'number') {
-      return [{ name: `${DISPLAY_NAME}${space}`, used: 0, display: '响应未包含余额字段' }]
+      return [{ name: `${displayName}${space}`, used: 0, display: '响应未包含余额字段' }]
     }
-    return [{ name: `${DISPLAY_NAME}${space}`, used: 0, display: `剩余 ${data.remaining}` }]
+    return [{ name: `${displayName}${space}`, used: 0, display: `剩余 ${data.remaining}` }]
   }
   // quota 端点失败可容忍（只影响 daily 的刷新时刻）
   let dailyResetIso
@@ -1228,29 +1298,53 @@ async function usage(credential) {
       display: `剩余 ${remaining}`,
     })
   }
-  return windows.length > 0 ? windows : [{ name: `${DISPLAY_NAME}${space}`, used: 0, display: '已登录' }]
+  return windows.length > 0 ? windows : [{ name: `${displayName}${space}`, used: 0, display: '已登录' }]
 }
 
 // ── 渠道对象 ────────────────────────────────────────────────────────────
 
-const fallbackModels = Object.fromEntries(FALLBACK_MODELS.map((m) => [slugOf(m.name) || m.id, {
+const modelsOf = (table) => Object.fromEntries(table.map((m) => [slugOf(m.name) || m.id, {
   name: m.multiple !== undefined ? `${m.name} · x${m.multiple}` : m.name,
   limit: { context: m.contextWindow, output: 8_192 },
   tool_call: true,
 }]))
 
-export const accioChannel = {
+/**
+ * 造一条渠道。
+ *
+ * 国内版与国际版是**同一份协议**、两条独立供应商（各自登录、各自开关、
+ * 各自额度），差别只在 `region` —— 它决定登录站点、`x-package-region` 头，
+ * 以及目录/映射表。区域也随凭据走，所以续期、空间切换都不会串。
+ */
+function makeChannel({ id, displayName, site, fallbackTable }) {
+  return {
+    id,
+    displayName,
+    site,
+    fallbackModels: modelsOf(fallbackTable),
+    beginLogin: (openBrowser) => beginLogin({ site, openBrowser }),
+    refresh: refreshCredential,
+    expired,
+    catalog,
+    chat,
+    /** 额度分桶（聚合层 usage 分发到这里）。 */
+    usage: (credential) => usage(credential, displayName),
+    /** 空间（个人/商户）列表与标签 —— 聚合层据此渲染切换入口。 */
+    listTeams,
+    spaceLabelOf,
+  }
+}
+
+export const accioChannel = makeChannel({
   id: CHANNEL_ID,
   displayName: DISPLAY_NAME,
-  fallbackModels,
-  beginLogin,
-  refresh: refreshCredential,
-  expired,
-  catalog,
-  chat,
-  /** 额度分桶（聚合层 usage 分发到这里）。 */
-  usage,
-  /** 空间（个人/商户）列表与标签 —— 聚合层据此渲染切换入口。 */
-  listTeams,
-  spaceLabelOf,
-}
+  site: SITE_CN,
+  fallbackTable: FALLBACK_MODELS,
+})
+
+export const accioGlobalChannel = makeChannel({
+  id: 'accio-global',
+  displayName: 'Accio 国际版',
+  site: SITE_GLOBAL,
+  fallbackTable: FALLBACK_MODELS_GLOBAL,
+})
