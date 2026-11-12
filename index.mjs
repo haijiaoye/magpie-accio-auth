@@ -1,0 +1,482 @@
+// Accio（阿里 Accio Work）—— magpie / OpenCode 独立供应商插件。
+//
+// 一个插件 = 一条供应商（`accio`）：浏览器登录、真实额度、商户空间切换、
+// 以及把 magpie 的 OpenAI 请求转成 Accio 的 Gemini 风格信封。
+//
+// ## 商户空间（team）
+//
+// Accio 的「商户空间」在接口层就是 **team**：`POST /api/team/queryUserTeams`
+// 取列表，之后所有网关请求带 `x-team-id` 头，额度类端点还要 `?teamId=`。
+// 空间选择是**账号级**属性，存进 magpie 的账号槽（`team_id` / `team_name`），
+// 续期时原样保留 —— 否则每次续期都会静默退回个人空间。
+//
+// ## 为什么能读账号槽
+//
+// magpie 给插件的 `client.auth` 只有 set/remove，没有 get。切换空间需要
+// **当前账号的 token**，所以这里以**只读**方式读取 magpie 自己的
+// `plugin-auth.json`（只取本供应商的槽，且绝不写入该文件 —— 写入一律走
+// `client.auth.set`，那是 magpie 的地盘）。
+
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+import {
+  accioChannel,
+  refreshCredential,
+  isTerminalRefreshError,
+  spaceLabelOf,
+} from './src/accio.mjs'
+import { debugLog } from './src/transport.mjs'
+
+export const PROVIDER = 'accio'
+const DISPLAY_NAME = 'Accio (阿里)'
+const REFRESH_LEAD_MS = 10 * 60 * 1000
+const BASE_URL = `https://${PROVIDER}.invalid`
+/** 旧的多渠道插件里的 Accio 槽 —— 一次性导入用。 */
+const LEGACY_KEY = 'hub-accio'
+
+// ── magpie 账号槽（只读）────────────────────────────────────────────────
+
+const authPath = () => process.env.MAGPIE_AUTH_PATH
+  ?? join(process.env.MAGPIE_CONFIG_DIR ?? join(homedir(), '.config', 'magpie'), 'plugin-auth.json')
+
+/** 本供应商的全部账号槽：`{key, auth}`（只读；不含别人的槽）。 */
+function readSlots() {
+  let all
+  try {
+    all = JSON.parse(readFileSync(authPath(), 'utf8'))
+  } catch {
+    return []
+  }
+  if (all === null || typeof all !== 'object') return []
+  const out = []
+  for (const [key, auth] of Object.entries(all)) {
+    if (auth === null || typeof auth !== 'object') continue
+    if (key !== PROVIDER && !key.startsWith(`${PROVIDER}#`)) continue
+    out.push({ key, auth })
+  }
+  return out.sort((a, b) => (a.key === PROVIDER ? -1 : b.key === PROVIDER ? 1 : a.key < b.key ? -1 : 1))
+}
+
+/** 主槽（`accio` 优先，否则第一个）。 */
+function primarySlot() {
+  return readSlots()[0]
+}
+
+/** 旧插件（hub-accio）的槽 —— 只在导入时读一次。 */
+function legacySlot() {
+  let all
+  try {
+    all = JSON.parse(readFileSync(authPath(), 'utf8'))
+  } catch {
+    return undefined
+  }
+  const auth = all?.[LEGACY_KEY]
+  return auth !== null && typeof auth === 'object' ? auth : undefined
+}
+
+// ── 凭据形状 ────────────────────────────────────────────────────────────
+
+/**
+ * magpie 的 oauth auth → 渠道凭据。
+ *
+ * magpie 存 `{type:'oauth', access, refresh, expires}`；渠道用
+ * `{access_token, refresh_token, expires_at}`。两套都要认：旧槽里可能
+ * 是渠道形状（hub 写的就是这一套）。
+ */
+function credentialOf(auth) {
+  if (auth === null || typeof auth !== 'object') return undefined
+  const access = typeof auth.access_token === 'string' && auth.access_token !== ''
+    ? auth.access_token
+    : typeof auth.access === 'string' ? auth.access : ''
+  const refresh = typeof auth.refresh_token === 'string' && auth.refresh_token !== ''
+    ? auth.refresh_token
+    : typeof auth.refresh === 'string' ? auth.refresh : ''
+  const expires = Number.isFinite(Number(auth.expires_at)) ? Number(auth.expires_at)
+    : Number.isFinite(Number(auth.expires)) ? Number(auth.expires) : undefined
+  if (access === '') return undefined
+  return {
+    access_token: access,
+    ...(refresh === '' ? {} : { refresh_token: refresh }),
+    ...(expires === undefined ? {} : { expires_at: expires }),
+    ...(typeof auth.sgcookie === 'string' && auth.sgcookie !== '' ? { sgcookie: auth.sgcookie } : {}),
+    ...(typeof auth.region === 'string' && auth.region !== '' ? { region: auth.region } : {}),
+    ...(typeof auth.team_id === 'string' && auth.team_id !== '' ? { team_id: auth.team_id } : {}),
+    ...(typeof auth.team_name === 'string' && auth.team_name !== '' ? { team_name: auth.team_name } : {}),
+  }
+}
+
+/** 渠道凭据 → 要交给 magpie 保存的 auth（oauth 形状 + 本插件附加字段）。 */
+function authOf(credential, extra = {}) {
+  return {
+    type: 'oauth',
+    channel: 'accio',
+    access: credential.access_token,
+    ...(typeof credential.refresh_token === 'string' && credential.refresh_token !== ''
+      ? { refresh: credential.refresh_token }
+      : {}),
+    ...(Number.isFinite(credential.expires_at) ? { expires: credential.expires_at } : {}),
+    ...(typeof credential.sgcookie === 'string' && credential.sgcookie !== '' ? { sgcookie: credential.sgcookie } : {}),
+    ...(typeof credential.region === 'string' && credential.region !== '' ? { region: credential.region } : {}),
+    ...(typeof credential.team_id === 'string' && credential.team_id !== '' ? { team_id: credential.team_id } : {}),
+    ...(typeof credential.team_name === 'string' && credential.team_name !== '' ? { team_name: credential.team_name } : {}),
+    ...extra,
+  }
+}
+
+// ── 续期去重 ────────────────────────────────────────────────────────────
+//
+// ⚠️ Accio 的 refresh_token **用一次就轮换**：同一账号并发续期会「一个成功、
+//    其余 invalid_grant」，失败方可能把好账号标死。同一凭据的并发请求共享
+//    同一个在途续期。
+
+const renewing = new Map()
+
+function gatedRenew(credential) {
+  const key = `${credential.access_token}:${credential.refresh_token ?? ''}`
+  const inFlight = renewing.get(key)
+  if (inFlight !== undefined) return inFlight
+  const run = refreshCredential(credential).finally(() => renewing.delete(key))
+  renewing.set(key, run)
+  return run
+}
+
+// ── 模型目录 ────────────────────────────────────────────────────────────
+
+/** 兜底目录（远端拉不到时用，选择器不会空掉）。 */
+const fallbackModels = accioChannel.fallbackModels
+
+async function catalogOf(credential) {
+  try {
+    const models = await accioChannel.catalog(credential)
+    if (models !== null && typeof models === 'object' && Object.keys(models).length > 0) return models
+  } catch (error) {
+    debugLog(`catalog failed: ${error?.message ?? error}`)
+  }
+  return fallbackModels
+}
+
+/** 请求体里的模型名可能是 `accio/kimi-k2-6` 或裸 `kimi-k2-6`。 */
+const stripProvider = (model) => {
+  const s = String(model ?? '').trim()
+  const prefix = `${PROVIDER}/`
+  return s.startsWith(prefix) ? s.slice(prefix.length) : s
+}
+
+// ── 空间切换 ────────────────────────────────────────────────────────────
+
+const spaceOf = (auth) => (typeof auth?.team_id === 'string' && auth.team_id !== ''
+  ? `商户空间 ${typeof auth.team_name === 'string' && auth.team_name !== '' ? auth.team_name : auth.team_id}`
+  : '个人空间')
+
+/**
+ * 「切换空间」入口。
+ *
+ * 借 magpie 的 api 型登录方式做一个**无 Key 的一键入口**：
+ *   - `keyless: true` → 不弹输入框；
+ *   - `ask(inputs)` → 动态返回空间列表（上游数据，静态 prompts 表达不了）；
+ *   - `authorize()` → 返回 oauth 形状的 success，magpie 按 `accountId` 去重，
+ *     原地更新同一个账号槽，不会多出一个账号。
+ */
+function buildSpaceMethod(authSet, toast) {
+  return {
+    type: 'api',
+    keyless: true,
+    label: '切换 Accio 空间（个人 / 商户）',
+    labels: { zh: '切换 Accio 空间（个人 / 商户）', en: 'Switch Accio space (personal / business)' },
+    async ask(inputs) {
+      if (inputs?.team !== undefined) return null
+      const slot = primarySlot()
+      if (slot === undefined) return null
+      const credential = credentialOf(slot.auth)
+      if (credential === undefined) return null
+      let teams
+      try {
+        teams = await accioChannel.listTeams(credential)
+      } catch (error) {
+        return {
+          type: 'select',
+          key: 'team',
+          message: `读取 Accio 空间列表失败：${error instanceof Error ? error.message : String(error)}`,
+          options: [{ label: '重试', value: '' }],
+        }
+      }
+      const options = [{
+        label: `个人空间（当前：${spaceOf(slot.auth)}）`,
+        value: 'personal',
+        hint: '使用 Accio 个人账号的额度',
+      }]
+      for (const team of teams) {
+        options.push({
+          label: `商户空间 · ${team.name}`,
+          value: team.teamId,
+          hint: [team.role, team.planId === '' ? '' : `plan ${team.planId}`].filter((s) => s !== '').join(' · '),
+        })
+      }
+      return {
+        type: 'select',
+        key: 'team',
+        message: teams.length === 0
+          ? '这个 Accio 账号没有加入任何商户空间'
+          : '选择要使用的 Accio 空间（切换后额度与模型目录都按该空间）',
+        options,
+      }
+    },
+    async authorize(inputs) {
+      const slot = primarySlot()
+      if (slot === undefined) {
+        return { type: 'failed', error: '请先登录 Accio 账号，再切换空间' }
+      }
+      const pick = String(inputs?.team ?? '').trim()
+      if (pick === '') return { type: 'failed', error: '没有选择空间' }
+
+      const stored = slot.auth
+      let credential = credentialOf(stored)
+      if (credential === undefined) {
+        return { type: 'failed', error: '账号槽里没有 access token，请重新登录 Accio' }
+      }
+      // 槽里的 token 可能已过期（切换时没有请求替它续期）：先续一次。
+      if (accioChannel.expired(credential) && typeof credential.refresh_token === 'string') {
+        try {
+          credential = await gatedRenew(credential)
+        } catch (error) {
+          return {
+            type: 'failed',
+            error: `续期失败：${error instanceof Error ? error.message : String(error)}。请重新登录 Accio`,
+          }
+        }
+      }
+
+      let teamId = ''
+      let teamName = ''
+      if (pick !== 'personal') {
+        let teams
+        try {
+          teams = await accioChannel.listTeams(credential)
+        } catch (error) {
+          return { type: 'failed', error: `读取空间列表失败：${error instanceof Error ? error.message : String(error)}` }
+        }
+        const hit = teams.find((team) => team.teamId === pick)
+        if (hit === undefined) return { type: 'failed', error: `空间 ${pick} 不在当前账号下` }
+        teamId = hit.teamId
+        teamName = hit.name
+      }
+
+      const next = {
+        ...authOf(credential),
+        ...(teamId === '' ? {} : { team_id: teamId, team_name: teamName }),
+        // accountId 必须与原来一致：magpie 按它去重写回同一个槽。
+        accountId: typeof stored.accountId === 'string' && stored.accountId !== ''
+          ? stored.accountId
+          : DISPLAY_NAME,
+      }
+      if (teamId === '') {
+        // 显式切回个人空间：字段必须真的删掉，不能留旧值。
+        delete next.team_id
+        delete next.team_name
+      }
+      toast(`${DISPLAY_NAME}：已切换到${teamId === '' ? '个人空间' : `商户空间 ${teamName}`}`)
+      // ⚠️ `type` 必须在最后：authOf() 带的是 `type: 'oauth'`（账号槽形状），
+      //    而 magpie 的登录结果要 `type: 'success'` —— 顺序反了会把结果判成失败。
+      return { ...next, type: 'success' }
+    },
+  }
+}
+
+// ── 插件 ────────────────────────────────────────────────────────────────
+
+/**
+ * magpie / OpenCode 插件函数。
+ *
+ * 只导出这一个函数（入口模块的每个函数导出都会被当成一条供应商）。
+ */
+export const AccioPlugin = async (input = {}) => {
+  const authSet = typeof input?.client?.auth?.set === 'function' ? input.client.auth.set : undefined
+  const toast = (message, variant = 'info') => {
+    try { void input?.client?.tui?.showToast?.({ body: { message, variant } }) } catch { /* 忽略 */ }
+    try { void input?.client?.app?.log?.({ level: 'info', message }) } catch { /* 忽略 */ }
+  }
+
+  // 旧的多渠道插件（magpie-providers-hub）里的 Accio 登录：本供应商还没有账号
+  // 时一次性搬过来，用户不必重新登录。只在**没有** accio 槽时动，幂等。
+  try {
+    if (readSlots().length === 0) {
+      const legacy = legacySlot()
+      if (legacy !== undefined) {
+        const credential = credentialOf(legacy)
+        if (credential !== undefined) {
+          await authSet?.({
+            path: { id: PROVIDER },
+            body: authOf(credential, {
+              accountId: typeof legacy.accountId === 'string' && legacy.accountId !== ''
+                ? legacy.accountId
+                : DISPLAY_NAME,
+            }),
+          })
+          toast(`${DISPLAY_NAME}：已从 Providers Hub 导入登录`)
+        }
+      }
+    }
+  } catch (error) {
+    debugLog(`legacy import failed: ${error?.message ?? error}`)
+  }
+
+  /** 取当前账号的凭据（magpie 已按账号作用域传入）。 */
+  const credentialFor = async (getAuth) => {
+    let auth
+    try {
+      auth = await getAuth?.()
+    } catch {
+      auth = undefined
+    }
+    let credential = credentialOf(auth)
+    if (credential === undefined) {
+      const slot = primarySlot()
+      credential = slot === undefined ? undefined : credentialOf(slot.auth)
+    }
+    return credential
+  }
+
+  const signedOut = (message) => Object.assign(new Error(message), { signIn: 'expired' })
+
+  return {
+    async config(cfg) {
+      cfg.provider ??= {}
+      cfg.provider[PROVIDER] ??= {
+        name: DISPLAY_NAME,
+        npm: '@ai-sdk/openai-compatible',
+        api: BASE_URL,
+        models: {},
+      }
+    },
+
+    auth: {
+      provider: PROVIDER,
+      refreshLead: REFRESH_LEAD_MS,
+
+      methods: [
+        {
+          type: 'oauth',
+          label: `登录 ${DISPLAY_NAME}`,
+          async authorize() {
+            // 不自己开浏览器：把 URL 交给 magpie（`opened` 不设 true），
+            // 它会在用户的默认浏览器里打开，与其它插件一致。
+            const started = await accioChannel.beginLogin()
+            return {
+              url: started.url,
+              method: 'auto',
+              instructions: started.instructions,
+              async callback() {
+                const credential = await started.result
+                const auth = authOf(credential, {
+                  accountId: DISPLAY_NAME,
+                })
+                toast(`${DISPLAY_NAME}：登录成功`)
+                // `type` 放最后：authOf() 带账号槽的 `type: 'oauth'`。
+                return { ...auth, type: 'success' }
+              },
+            }
+          },
+        },
+        buildSpaceMethod(authSet, toast),
+      ],
+
+      async refresh(auth) {
+        const credential = credentialOf(auth)
+        if (credential === undefined) return undefined
+        try {
+          const next = await gatedRenew(credential)
+          return authOf(next, {
+            accountId: typeof auth?.accountId === 'string' && auth.accountId !== '' ? auth.accountId : DISPLAY_NAME,
+          })
+        } catch (error) {
+          if (isTerminalRefreshError(error)) throw signedOut(String(error?.message ?? error))
+          throw error
+        }
+      },
+
+      async loader(getAuth) {
+        return {
+          // ⚠️ baseURL 不能是空串：magpie 会据此判「无处可发」；真正上游在 fetch 里改写。
+          baseURL: BASE_URL,
+          apiKey: PROVIDER,
+          async fetch(request, init) {
+            let body
+            try {
+              body = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined
+            } catch {
+              body = undefined
+            }
+            const model = stripProvider(body?.model)
+            if (model === '') {
+              return Response.json(
+                { error: { type: 'invalid_request_error', message: `无法识别的模型：${body?.model ?? '(空)'}` } },
+                { status: 404 },
+              )
+            }
+            const credential = await credentialFor(getAuth)
+            if (credential === undefined) {
+              return Response.json(
+                { error: { type: 'authentication_error', message: `未登录 ${DISPLAY_NAME}，请先在供应商页登录` } },
+                { status: 401 },
+              )
+            }
+            try {
+              return await accioChannel.chat(credential, {
+                body: { ...body, model },
+                signal: init?.signal,
+                renew: (current) => gatedRenew(current),
+              })
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error)
+              return Response.json(
+                { error: { type: 'provider_error', message } },
+                { status: 502 },
+              )
+            }
+          },
+        }
+      },
+
+      async usage(getAuth) {
+        const credential = await credentialFor(getAuth)
+        if (credential === undefined) {
+          return {
+            plan: DISPLAY_NAME,
+            windows: [{ name: DISPLAY_NAME, used: 0, display: `未登录（${PROVIDER}）` }],
+          }
+        }
+        try {
+          const windows = await accioChannel.usage(credential)
+          return { plan: `${DISPLAY_NAME} · ${spaceLabelOf(credential)}`, windows }
+        } catch (error) {
+          return {
+            plan: DISPLAY_NAME,
+            windows: [{
+              name: DISPLAY_NAME,
+              used: 0,
+              display: `额度查询失败：${error instanceof Error ? error.message : String(error)}`,
+            }],
+          }
+        }
+      },
+    },
+
+    provider: {
+      id: PROVIDER,
+      /**
+       * ⚠️ 第二参是 magpie 给的上下文（`{ auth }`）：凭据只在内存/账号槽，
+       *    冷启动时用 `auth` 才能拉到当前空间的远端目录。
+       */
+      async models(provider, ctx = {}) {
+        const auth = ctx?.auth
+        const credential = credentialOf(auth) ?? credentialOf(primarySlot()?.auth)
+        if (credential === undefined) return provider?.models ?? fallbackModels
+        return catalogOf(credential)
+      },
+    },
+  }
+}
+
+export default AccioPlugin
