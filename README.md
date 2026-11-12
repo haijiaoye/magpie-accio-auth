@@ -29,9 +29,11 @@ magpie plugin add github:haijiaoye/magpie-accio-auth
      **切换 Accio 空间（个人 / 商户）**，选目标空间即可；
    - 命令行：
      ```bash
-     magpie plugin login accio 1
+     magpie plugin login accio 2
      ```
-     `1` 是个人空间，`2` 及以后是各个商户空间。
+     第二个参数是**登录方式**的序号，不是空间序号：`1` 是浏览器登录，
+     `2` 是「切换 Accio 空间」。进入后按提示选择个人空间或某个商户空间。
+     也可以直接跑 `magpie plugin login accio`，在菜单里选第 2 项。
 
 切换是**原地更新**同一个账号槽，不会多出一个账号。
 
