@@ -68,6 +68,10 @@ magpie plugin add github:haijiaoye/magpie-accio-auth
 且同名模型（Qwen 3.8 Max）在两边的 `modelCode` 也不同 —— 所以模型映射表
 按区域分开存，兜底目录也是两张表，不能合并。
 
+⚠️ 请求体的 `properties` 只放 `normalized_response`。多放 `utdid` / `version` /
+`appKey` 在国内模型上没事，但国际版的 GPT / Claude 会直接拒收
+（`Unknown parameter: 'utdid'`，HTTP 200 + 流内 500）。`utdid` 只放在请求头。
+
 Accio 的「商户空间」在接口层就是 **team**：
 
 - 列表：`POST /api/team/queryUserTeams`，token 在 **body**（`{accessToken}`）；
