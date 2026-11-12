@@ -666,7 +666,10 @@ function buildBody({ model, accessToken, contents, systemInstruction, tools, tem
     temperature,
     maxOutputTokens,
     stopSequences: [],
-    properties: { utdid: utdidOf(), version: APP_VERSION, appKey: APP_KEY, normalizedResponse: 'true' },
+    // ⚠️ properties 只放 `normalized_response`。多放 `utdid` / `version` / `appKey`
+    //    在国内模型上无碍，但国际版的 GPT / Claude 会**直接拒收**：
+    //    `Unknown parameter: 'utdid'`（HTTP 200 + 流内 500）。utdid 只走请求头。
+    properties: { normalizedResponse: 'true' },
     token: accessToken,
     messageId: messageIdOf(requestId),
     incremental: true,
@@ -674,12 +677,7 @@ function buildBody({ model, accessToken, contents, systemInstruction, tools, tem
   const body = accioToSnake(camel)
   // ⚠️ properties 子树不参与 snake 转换：实测成功形状里 appKey 是驼峰、
   // normalized_response 是 snake（两种键形混用），走通用转换是未实测形状。
-  body.properties = {
-    utdid: utdidOf(),
-    version: APP_VERSION,
-    appKey: APP_KEY,
-    normalized_response: 'true',
-  }
+  body.properties = { normalized_response: 'true' }
   return body
 }
 
