@@ -113,8 +113,13 @@ function credentialOf(auth) {
   }
 }
 
-/** 渠道凭据 → 要交给 magpie 保存的 auth（oauth 形状 + 本插件附加字段）。 */
-function authOf(credential, channel, extra = {}) {
+/**
+ * 渠道凭据 → 要交给 magpie 保存的 auth（oauth 形状 + 本插件附加字段）。
+ *
+ * `region` 由调用方按**供应商**传入并覆盖凭据里的值 —— 国际版复用国内版登录时，
+ * 源凭据带的是 `cn`，照抄会让国际版槽永久记住错误的区域。
+ */
+function authOf(credential, channel, extra = {}, region) {
   return {
     type: 'oauth',
     channel,
@@ -124,7 +129,7 @@ function authOf(credential, channel, extra = {}) {
       : {}),
     ...(Number.isFinite(credential.expires_at) ? { expires: credential.expires_at } : {}),
     ...(typeof credential.sgcookie === 'string' && credential.sgcookie !== '' ? { sgcookie: credential.sgcookie } : {}),
-    ...(typeof credential.region === 'string' && credential.region !== '' ? { region: credential.region } : {}),
+    ...(typeof region === 'string' && region !== '' ? { region } : {}),
     ...(typeof credential.team_id === 'string' && credential.team_id !== '' ? { team_id: credential.team_id } : {}),
     ...(typeof credential.team_name === 'string' && credential.team_name !== '' ? { team_name: credential.team_name } : {}),
     ...extra,
@@ -183,6 +188,8 @@ const spaceOf = (auth) => (typeof auth?.team_id === 'string' && auth.team_id !==
  *     原地更新同一个账号槽，不会多出一个账号。
  */
 function buildSpaceMethod({ channel, provider, displayName, spaceLabel, authSet, toast }) {
+  /** 区域以供应商为准（见 makePlugin 里 credentialFor 的同款说明）。 */
+  const withSite = (credential) => (credential === undefined ? undefined : { ...credential, region: channel.site })
   return {
     type: 'api',
     keyless: true,
@@ -195,7 +202,7 @@ function buildSpaceMethod({ channel, provider, displayName, spaceLabel, authSet,
       if (inputs?.team !== undefined) return null
       const slot = primarySlot(provider)
       if (slot === undefined) return null
-      const credential = credentialOf(slot.auth)
+      const credential = withSite(credentialOf(slot.auth))
       if (credential === undefined) return null
       let teams
       try {
@@ -238,7 +245,7 @@ function buildSpaceMethod({ channel, provider, displayName, spaceLabel, authSet,
       if (pick === '') return { type: 'failed', error: '没有选择空间' }
 
       const stored = slot.auth
-      let credential = credentialOf(stored)
+      let credential = withSite(credentialOf(stored))
       if (credential === undefined) {
         return { type: 'failed', error: `账号槽里没有 access token，请重新登录 ${displayName}` }
       }
@@ -270,7 +277,7 @@ function buildSpaceMethod({ channel, provider, displayName, spaceLabel, authSet,
       }
 
       const next = {
-        ...authOf(credential, channel.id),
+        ...authOf(credential, channel.id, {}, channel.site),
         ...(teamId === '' ? {} : { team_id: teamId, team_name: teamName }),
         // accountId 必须与原来一致：magpie 按它去重写回同一个槽。
         accountId: typeof stored.accountId === 'string' && stored.accountId !== ''
@@ -331,7 +338,7 @@ function makePlugin({
                   accountId: typeof legacy.accountId === 'string' && legacy.accountId !== ''
                     ? legacy.accountId
                     : displayName,
-                }),
+              }, channel.site),
               })
               toast(`${displayName}：已从 Providers Hub 导入登录`)
             }
@@ -357,7 +364,7 @@ function makePlugin({
                 accountId: typeof source.auth.accountId === 'string' && source.auth.accountId !== ''
                   ? source.auth.accountId
                   : displayName,
-              }),
+              }, channel.site),
             })
             toast(`${displayName}：已复用 ${seedFrom} 的登录`)
           }
@@ -380,7 +387,9 @@ function makePlugin({
         const slot = primarySlot(provider)
         credential = slot === undefined ? undefined : credentialOf(slot.auth)
       }
-      return credential
+      // ⚠️ 区域由**供应商**决定，不信账号槽里的值：国际版是从国内版复用的
+      //    登录态，槽里可能还带着 `region: 'cn'` —— 照抄就会去拉国内目录。
+      return credential === undefined ? undefined : { ...credential, region: channel.site }
     }
 
     const signedOut = (message) => Object.assign(new Error(message), { signIn: 'expired' })
@@ -416,7 +425,7 @@ function makePlugin({
                   const credential = await started.result
                   const auth = authOf(credential, channel.id, {
                     accountId: displayName,
-                  })
+                  }, channel.site)
                   toast(`${displayName}：登录成功`)
                   // `type` 放最后：authOf() 带账号槽的 `type: 'oauth'`。
                   return { ...auth, type: 'success' }
@@ -434,7 +443,7 @@ function makePlugin({
           const next = await gatedRenew(credential)
           return authOf(next, channel.id, {
             accountId: typeof auth?.accountId === 'string' && auth.accountId !== '' ? auth.accountId : displayName,
-          })
+          }, channel.site)
         } catch (error) {
           if (isTerminalRefreshError(error)) throw signedOut(String(error?.message ?? error))
           throw error
@@ -516,7 +525,9 @@ function makePlugin({
          */
         async models(prov, ctx = {}) {
           const auth = ctx?.auth
-          const credential = credentialOf(auth) ?? credentialOf(primarySlot(provider)?.auth)
+          const raw = credentialOf(auth) ?? credentialOf(primarySlot(provider)?.auth)
+          // 区域按供应商归一（同 credentialFor：国际版可能复用了国内登录态）。
+          const credential = raw === undefined ? undefined : { ...raw, region: channel.site }
           if (credential === undefined) {
             // ⚠️ 空对象也是「有值」：`prov.models ?? fallback` 会在宿主传 `{}` 时
             //    返回空目录，选择器整个空掉。必须按键数判。

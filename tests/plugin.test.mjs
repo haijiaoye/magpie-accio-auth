@@ -214,8 +214,29 @@ test('国际版复用国内版登录态（同一账号，不必登录两次）',
   assert.equal(saved.length, 1)
   assert.equal(saved[0].path.id, PROVIDER_GLOBAL)
   assert.equal(saved[0].body.channel, 'accio-global')
+  // 区域必须按供应商归一：源槽带的是国内区域，照抄会让国际版永久拉国内目录。
+  assert.equal(saved[0].body.region, 'global')
   assert.equal(saved[0].body.access, credential.access_token)
   assert.equal(saved[0].body.team_id, credential.team_id)
+})
+
+test('国际版即便槽里记着国内区域，也按国际目录拉模型', async () => {
+  // 复用国内登录后槽里可能留着 region: 'cn'
+  authFile({
+    'accio-global': {
+      type: 'oauth',
+      channel: 'accio-global',
+      access: 'a',
+      refresh: 'r',
+      expires: Date.now() + 3_600_000,
+      region: 'cn',
+    },
+  })
+  const plugin = await globalHook()
+  const models = await plugin.provider.models({ models: {} }, {})
+  // 没有网络时走国际兜底表：有 Claude、没有 GLM
+  assert.ok('claude-sonnet-5' in models)
+  assert.ok(!('glm-5-3' in models))
 })
 
 test('两条供应商的兜底目录互不混入对方的模型', async () => {
