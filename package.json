@@ -1,6 +1,6 @@
 {
   "name": "magpie-accio-auth",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Accio (Alibaba Accio Work) as standalone magpie / OpenCode providers: CN (www.accio-ai.com) and Global (www.accio.com), with browser sign-in, real quota, and personal / business (team) space switching.",
   "type": "module",
   "main": "./index.mjs",

@@ -29,6 +29,17 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
 import { fetchWithRetry } from './transport.mjs'
+/**
+ * utdid：装机级稳定 id（阿里网关用它做风控基线；缺失会吃到 200+风控拦截页）。
+ *
+ * ✅ v0.2.1 起落盘复用（实现见 `state.mjs`）：指纹写在自己的缓存目录
+ *    `~/.cache/magpie-accio/utdid`，**依然不碰 magpie 的配置目录**（PR #502 审核
+ *    第 2 条）。之前只存进程内存，magpie 一重启就换指纹 —— 同机同账号指纹反复
+ *    跳变反而更像异常流量。
+ *
+ * 覆盖方式：`MAGPIE_ACCIO_UTDID`（直接指定）/ `MAGPIE_ACCIO_STATE_DIR`（换目录）。
+ */
+import { utdidOf } from './state.mjs'
 
 export const CHANNEL_ID = 'accio'
 export const DISPLAY_NAME = 'Accio (阿里)'
@@ -114,25 +125,6 @@ const sgKOf = (requestId) => createHash('md5').update(requestId, 'utf8').digest(
 /** message_id 必填（缺它上游 400）；掺随机量防上游按它去重。 */
 const messageIdOf = (requestId) =>
   createHash('md5').update(`${requestId}:${randomBytes(16).toString('hex')}`, 'utf8').digest('hex')
-
-/**
- * utdid：装机级稳定 id（阿里网关用它做风控基线；缺失会吃到 200+风控拦截页）。
- *
- * ⚠️ v0.5.0 起**只放在进程内存**（`process.esk.accioUtdid`），不再写
- *    `~/.config/magpie/accio-state.json` —— 插件不往 magpie 的配置目录写任何
- *    文件（PR #502 审核第 2 条）。代价：magpie 重启后 utdid 换新 —— 阿里网关
- *    只把它当风控基线，换新不拦（真机登录链路不依赖它的连续性）。
- */
-function loadUtdid() {
-  const utdid = `accio-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`
-  return utdid
-}
-
-const utdidOf = () => {
-  process.esk ??= {}
-  process.esk.accioUtdid ??= loadUtdid()
-  return process.esk.accioUtdid
-}
 
 // ── 登录：PKCE + 本地 loopback 回调（Accio 对 return_url 无白名单校验）────
 

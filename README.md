@@ -72,6 +72,11 @@ magpie plugin add github:haijiaoye/magpie-accio-auth
 `appKey` 在国内模型上没事，但国际版的 GPT / Claude 会直接拒收
 （`Unknown parameter: 'utdid'`，HTTP 200 + 流内 500）。`utdid` 只放在请求头。
 
+`utdid` 是阿里网关的**装机级风控基线**（缺了会吃到 200 + 风控拦截页），本插件
+把它落盘复用：首次生成后写 `~/.cache/magpie-accio/utdid`（`0600`），之后 magpie
+重启也是同一个指纹。落盘用 hard link 原子发布，所以同时开多个 magpie 进程也会
+收敛到同一个 id，而不是各写各的。
+
 Accio 的「商户空间」在接口层就是 **team**：
 
 - 列表：`POST /api/team/queryUserTeams`，token 在 **body**（`{accessToken}`）；
@@ -91,6 +96,13 @@ Accio 的「商户空间」在接口层就是 **team**：
   里**本供应商**的槽（`accio` / `accio#…` 或 `accio-global` / `accio-global#…`），
   不碰其它供应商的条目。
 - 诊断日志默认关闭；`MAGPIE_ACCIO_DEBUG=1` 时写到系统临时目录。
+- 唯一的自有状态文件是设备指纹 `~/.cache/magpie-accio/utdid`（随机 id，不含
+  账号信息）。想换位置或固定值：
+
+  | 环境变量 | 作用 |
+  | --- | --- |
+  | `MAGPIE_ACCIO_STATE_DIR` | 状态目录整体搬家（默认 `$XDG_CACHE_HOME` 或 `~/.cache` 下的 `magpie-accio`） |
+  | `MAGPIE_ACCIO_UTDID` | 直接指定指纹，不再读写状态文件 |
 
 ## 测试
 
