@@ -171,12 +171,12 @@ function unwrapEnvelope(path, status, text) {
 }
 
 /** data → 凭据。⚠️ 三者缺一不可（官方客户端同款校验）；expiresAt 秒→毫秒在此一次性完成。 */
-function toCredential(path, data, extra = {}) {
-  const access = data.accessToken
-  const refresh = data.refreshToken
+function toCredential(path, data, extra = {}, previous = undefined) {
+  const access = nonEmpty(data.accessToken) ?? nonEmpty(previous?.access_token)
+  const refresh = nonEmpty(data.refreshToken) ?? nonEmpty(previous?.refresh_token)
   const expiresAt = accioExpiresAtMs(data.expiresAt)
-  if (typeof access !== 'string' || access === '') throw new Error(`accio: ${path} 响应缺 accessToken`)
-  if (typeof refresh !== 'string' || refresh === '') throw new Error(`accio: ${path} 响应缺 refreshToken`)
+  if (access === undefined) throw new Error(`accio: ${path} 响应缺 accessToken`)
+  if (refresh === undefined) throw new Error(`accio: ${path} 响应缺 refreshToken`)
   if (expiresAt === undefined) throw new Error(`accio: ${path} 响应缺 expiresAt（或非正数）`)
   return {
     access_token: access,
@@ -211,10 +211,30 @@ export const isTerminalRefreshError = (error) => {
   return TERMINAL_MARKERS.some((m) => lowered.includes(m.toLowerCase()))
 }
 
+/** 只取 media type（去掉 `; charset=…`、空格、大小写差异）。 */
+export const mediaTypeOf = (contentType) => String(contentType ?? '').split(';', 1)[0].trim().toLowerCase()
+
+/**
+ * 网关风控拦截页：401/403 + HTML。
+ *
+ * ⚠️ 这不是 token 过期。账号被删除、封禁或被 WAF 拦截时，网关返回 HTML 页。
+ *    此时续期只会白白消费一次性的 refresh_token，重试也只会再次撞风控。
+ */
+export const isGatewayDenial = (status, contentType) =>
+  (status === 401 || status === 403) && ['text/html', 'application/xhtml+xml'].includes(mediaTypeOf(contentType))
+
+export class AccioDeniedError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'AccioDeniedError'
+    this.code = 'PERMISSION_DENIED'
+  }
+}
+
 /**
  * 续期。⚠️⚠️ **刷新会轮换 refresh_token**（参考实现明确记录）——
  * 并发续期会「1 成功、其余 invalid_grant」，失败方会把好账号标死。
- * 串行由聚合层的 gatedRenew 保证（与 DSH 的 SerialQueue 同位）。
+ * 串行与锁内重读由插件层保证。
  */
 export async function refreshCredential(current) {
   if (typeof current?.refresh_token !== 'string' || current.refresh_token === '') {
@@ -226,10 +246,13 @@ export async function refreshCredential(current) {
     body: JSON.stringify({ accessToken: current.access_token, refreshToken: current.refresh_token }),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   })
+  if (isGatewayDenial(res.status, res.headers.get('content-type'))) {
+    throw new AccioDeniedError(`accio: 续期被网关拦截（HTTP ${res.status} HTML），疑似风控；已停止，请在官方客户端确认账号状态`)
+  }
   const text = await res.text()
   const next = toCredential(REFRESH_PATH, unwrapEnvelope(REFRESH_PATH, res.status, text), {
     region: current.region === SITE_GLOBAL ? SITE_GLOBAL : SITE_CN,
-  })
+  }, current)
   if (typeof current.sgcookie === 'string' && next.sgcookie === undefined) next.sgcookie = current.sgcookie
   // ⚠️ 空间选择是**凭据的一部分**（同一份 token 可读个人或商户空间），
   //    续期只换 token，空间必须原样带过去 —— 否则每次续期都静默退回个人空间。
@@ -1068,6 +1091,14 @@ function errorDetail(body) {
  * 发一次对话。⚠️ token 在 **body**（放 Authorization 头恒流内 402 —— 本渠道
  * 最经典的坑）；401/403 先续期一次再重发（body.token 必须换成新值）。
  */
+function deniedResponse(status, detail) {
+  const text = String(detail ?? '').replace(/\s+/g, ' ').slice(0, 200)
+  return Response.json(
+    { error: { type: 'permission_error', code: 'PERMISSION_DENIED', message: `accio: 网关返回 HTTP ${status} 拦截页，疑似风控或账号受限；已停止续期和重试，请先在官方客户端确认账号状态。${text === '' ? '' : ` 服务端原文：${text}`}` } },
+    { status: 403 },
+  )
+}
+
 async function chat(credential, { body: openaiBody, signal, renew }) {
   const slug = String(openaiBody?.model ?? '')
   const wireModel = codeOf(slug, credential)
@@ -1107,18 +1138,27 @@ async function chat(credential, { body: openaiBody, signal, renew }) {
   )
 
   let response = await send(credential)
+  if (isGatewayDenial(response.status, response.headers.get('content-type'))) {
+    const peek = await response.text().catch(() => '')
+    return deniedResponse(response.status, peek)
+  }
   // HTTP 401/403：凭据可能被服务端提前撤销而本地 expires_at 未到 —— 续期一次重发。
   // ⚠️ token 在 body 里，重发前必须把新 token 写回（applyAccessToken 同位）。
   if ((response.status === 401 || response.status === 403) && typeof renew === 'function') {
     let renewed
     try {
       renewed = await renew(credential)
-    } catch {
+    } catch (error) {
+      if (error instanceof AccioDeniedError) return deniedResponse(403, error.message)
       renewed = undefined
     }
     if (renewed !== undefined && renewed.access_token !== credential.access_token) {
       payload.token = renewed.access_token
       response = await send(renewed)
+      if (isGatewayDenial(response.status, response.headers.get('content-type'))) {
+        const peek = await response.text().catch(() => '')
+        return deniedResponse(response.status, peek)
+      }
     }
   }
 

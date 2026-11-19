@@ -35,6 +35,7 @@ import {
   SITE_GLOBAL,
 } from './src/accio.mjs'
 import { debugLog } from './src/transport.mjs'
+import { renewOnce, sweepRotations } from './src/renew-lock.mjs'
 
 export const PROVIDER = 'accio'
 export const PROVIDER_GLOBAL = 'accio-global'
@@ -136,21 +137,69 @@ function authOf(credential, channel, extra = {}, region) {
   }
 }
 
-// ── 续期去重 ────────────────────────────────────────────────────────────
+// ── 续期 ────────────────────────────────────────────────────────────────
 //
-// ⚠️ Accio 的 refresh_token **用一次就轮换**：同一账号并发续期会「一个成功、
-//    其余 invalid_grant」，失败方可能把好账号标死。同一凭据的并发请求共享
-//    同一个在途续期。
+// ⚠️ Accio 的 refresh_token **用一次就轮换**。三层保护：
+//   1. 进程内：同一个 refresh_token 只发一次续期，并发请求共享结果；
+//   2. 跨进程：按 refresh_token 指纹上文件锁，锁内先看它是否刚被换过；
+//   3. 跨槽：国内版和国际版共用同一个 refresh_token，任何一边续期后都把
+//      新凭据同步给另一边，避免另一边以后拿旧 token 续期被判 invalid_grant。
 
 const renewing = new Map()
+const SIBLINGS = [PROVIDER, PROVIDER_GLOBAL]
 
 function gatedRenew(credential) {
-  const key = `${credential.access_token}:${credential.refresh_token ?? ''}`
+  const key = credential.refresh_token ?? ''
   const inFlight = renewing.get(key)
   if (inFlight !== undefined) return inFlight
-  const run = refreshCredential(credential).finally(() => renewing.delete(key))
+  const run = renewOnce(credential, refreshCredential).finally(() => renewing.delete(key))
   renewing.set(key, run)
   return run
+}
+
+/**
+ * 续期成功后，把新凭据写给仍持有旧 refresh_token 的其它 Accio 槽。
+ *
+ * 只同步主槽（`accio` / `accio-global`），且只在对方的 refresh_token 和旧值
+ * 完全相同时才写，避免覆盖用户另外登录的账号。
+ */
+async function syncRotated(authSet, self, previous, next, { includeSelf = false } = {}) {
+  if (typeof authSet !== 'function' || previous?.refresh_token === next?.refresh_token) return
+  for (const provider of SIBLINGS) {
+    if (provider === self && !includeSelf) continue
+    const slot = readSlots(provider).find((item) => item.key === provider)
+    const stored = credentialOf(slot?.auth)
+    if (stored?.refresh_token !== previous.refresh_token) continue
+    try {
+      await authSet({
+        path: { id: provider },
+        body: {
+          ...slot.auth,
+          type: 'oauth',
+          access: next.access_token,
+          refresh: next.refresh_token,
+          expires: next.expires_at,
+          ...(next.sgcookie === undefined ? {} : { sgcookie: next.sgcookie }),
+        },
+      })
+    } catch (error) {
+      debugLog(`sync rotated token to ${provider} failed: ${error?.message ?? error}`)
+    }
+  }
+}
+
+/** 自己的 refresh_token 已作废时，看兄弟槽是否已经拿到同一账号的新凭据。 */
+function rotatedSibling(self, auth, previous) {
+  for (const provider of SIBLINGS) {
+    if (provider === self) continue
+    const slot = readSlots(provider).find((item) => item.key === provider)
+    const candidate = credentialOf(slot?.auth)
+    if (candidate?.refresh_token === undefined || candidate.refresh_token === previous.refresh_token) continue
+    if (!(Number(candidate.expires_at) > Date.now())) continue
+    if ((slot.auth.accountId ?? '') !== (auth?.accountId ?? '')) continue
+    return candidate
+  }
+  return undefined
 }
 
 // ── 模型目录 ────────────────────────────────────────────────────────────
@@ -251,8 +300,10 @@ function buildSpaceMethod({ channel, provider, displayName, spaceLabel, authSet,
       }
       // 槽里的 token 可能已过期（切换时没有请求替它续期）：先续一次。
       if (channel.expired(credential) && typeof credential.refresh_token === 'string') {
+        const previous = credential
         try {
           credential = await gatedRenew(credential)
+          await syncRotated(authSet, provider, previous, credential)
         } catch (error) {
           return {
             type: 'failed',
@@ -317,6 +368,7 @@ function makePlugin({
   const stripOwn = (model) => stripProvider(model, provider)
 
   return async (input = {}) => {
+  sweepRotations()
   const authSet = typeof input?.client?.auth?.set === 'function' ? input.client.auth.set : undefined
   const toast = (message, variant = 'info') => {
     try { void input?.client?.tui?.showToast?.({ body: { message, variant } }) } catch { /* 忽略 */ }
@@ -441,10 +493,20 @@ function makePlugin({
         if (credential === undefined) return undefined
         try {
           const next = await gatedRenew(credential)
+          await syncRotated(authSet, provider, credential, next)
           return authOf(next, channel.id, {
             accountId: typeof auth?.accountId === 'string' && auth.accountId !== '' ? auth.accountId : displayName,
           }, channel.site)
         } catch (error) {
+          if (error?.code === 'PERMISSION_DENIED') throw signedOut(String(error?.message ?? error))
+          if (isTerminalRefreshError(error)) {
+            const sibling = rotatedSibling(provider, auth, credential)
+            if (sibling !== undefined) {
+              return authOf({ ...credential, ...sibling }, channel.id, {
+                accountId: typeof auth?.accountId === 'string' && auth.accountId !== '' ? auth.accountId : displayName,
+              }, channel.site)
+            }
+          }
           if (isTerminalRefreshError(error)) throw signedOut(String(error?.message ?? error))
           throw error
         }
@@ -480,7 +542,11 @@ function makePlugin({
               return await channel.chat(credential, {
                 body: { ...body, model },
                 signal: init?.signal,
-                renew: (current) => gatedRenew(current),
+                renew: async (current) => {
+                  const next = await gatedRenew(current)
+                  await syncRotated(authSet, provider, current, next, { includeSelf: true })
+                  return next
+                },
               })
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error)

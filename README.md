@@ -88,16 +88,39 @@ Accio 的「商户空间」在接口层就是 **team**：
 
 对话走 Gemini 风格信封，`token` 必须在 **body**（放 `Authorization` 头会恒流内 402）。
 
+### refresh_token 轮换
+
+Accio 的 `refresh_token` 用一次就会换新。国内版和国际版复用同一个登录态，
+所以两个供应商槽一开始持有同一个 `refresh_token`。插件做了三层保护：
+
+- **进程内去重**：同一个 `refresh_token` 只发一次续期，并发请求共享结果。
+- **跨进程锁**：按 `refresh_token` 的 SHA-256 指纹加锁；锁内发现它刚被其它 magpie
+  进程换过时，直接复用新凭据，不再消费旧 token。
+- **跨槽同步**：任一供应商续期后，把新凭据同步给仍持有同一旧 token 的另一个
+  Accio 供应商；如果自己的旧 token 已被换掉，会接管兄弟槽里同账号的新凭据。
+
+续期接口返回 HTML 拦截页时按风控处理。续期响应缺 `accessToken` 或
+`refreshToken` 时，会保留旧值，不把仍可用的凭据丢掉。
+
+### 风控拦截页
+
+网关返回 `401/403 + text/html` 时，插件直接返回 `PERMISSION_DENIED`，
+不续期、不重试。这类页面通常表示账号受限或请求被 WAF 拦截；继续续期会白白
+消费一次性 `refresh_token`，继续重试也只会再次撞上拦截。
+
 ## 隐私
 
 - 插件**不写** magpie 的配置文件。账号只存在 magpie 自己的账号槽里
   （写入走宿主提供的 `client.auth.set`）。
-- 切换空间需要读当前账号的 token，因此以**只读**方式读 `plugin-auth.json`
-  里**本供应商**的槽（`accio` / `accio#…` 或 `accio-global` / `accio-global#…`），
-  不碰其它供应商的条目。
+- 切换空间和续期同步需要读当前 token，因此以**只读**方式读取 `plugin-auth.json`
+  里的 `accio` / `accio#…` 与 `accio-global` / `accio-global#…` 槽，不碰其它供应商。
+  续期同步只通过 `client.auth.set` 更新仍持有同一旧 `refresh_token` 的 Accio 主槽。
 - 诊断日志默认关闭；`MAGPIE_ACCIO_DEBUG=1` 时写到系统临时目录。
-- 唯一的自有状态文件是设备指纹 `~/.cache/magpie-accio/utdid`（随机 id，不含
-  账号信息）。想换位置或固定值：
+- 续期时会在 `~/.cache/magpie-accio/renew/` 放锁和短期轮换记录（`0600`），
+  用来让多个 magpie 进程复用同一次续期结果；记录按旧 token 的哈希命名，
+  5 分钟后自动删除。
+- 设备指纹存在 `~/.cache/magpie-accio/utdid`（随机 id，不含账号信息）。
+  想换位置或固定值：
 
   | 环境变量 | 作用 |
   | --- | --- |
