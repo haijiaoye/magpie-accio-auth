@@ -268,3 +268,12 @@ test('国际版未登录时同样返回 401', async () => {
   })
   assert.equal(response.status, 401)
 })
+
+test('模型输出上限不再是 8192（推理模型会把 8192 全花在思考上）', async () => {
+  for (const plugin of [await hook(), await globalHook()]) {
+    const models = await plugin.provider.models({ models: {} }, {})
+    for (const [id, model] of Object.entries(models)) {
+      assert.equal(model.limit.output, 65_536, id)
+    }
+  }
+})

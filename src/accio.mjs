@@ -84,6 +84,13 @@ const REQUEST_TIMEOUT_MS = 30_000
 const LOGIN_TIMEOUT_MS = 600_000
 /** 临期提前量（对齐本插件其它渠道的 10 分钟口径；DSH 是到点才续）。 */
 const EXPIRY_LEAD_MS = 10 * 60 * 1000
+/**
+ * 默认输出上限。⚠️ 目录不给 maxTokens，旧值 8192 会让 magpie 把请求截在 8192，
+ * 推理模型（Claude / GPT 高档位）思考就耗尽 ⇒「an empty reply … whole output
+ * spent on reasoning」。实测（2026-11-19）国内 16 / 国际 30 个模型均接受 65536；
+ * 上游真实上限更高（如 Qwen 520000），不要写超过它的值。
+ */
+export const DEFAULT_MAX_OUTPUT = 65_536
 
 // ── 小工具 ───────────────────────────────────────────────────────────────
 
@@ -538,7 +545,7 @@ async function catalog(credential) {
       name: entry.multiple !== undefined ? `${entry.name} · x${entry.multiple}` : entry.name,
       limit: {
         context: entry.contextWindow > 0 ? entry.contextWindow : 128_000,
-        output: entry.maxTokens ?? 8_192,
+        output: entry.maxTokens ?? DEFAULT_MAX_OUTPUT,
       },
       tool_call: true,
       capabilities: {
@@ -1107,7 +1114,7 @@ async function chat(credential, { body: openaiBody, signal, renew }) {
   const requestedMax = Number(openaiBody?.max_tokens)
   const maxOutputTokens = Number.isSafeInteger(requestedMax) && requestedMax > 0
     ? requestedMax
-    : 8192
+    : DEFAULT_MAX_OUTPUT
   const stop = Array.isArray(openaiBody?.stop)
     ? openaiBody.stop.filter((s) => typeof s === 'string' && s !== '')
     : (typeof openaiBody?.stop === 'string' && openaiBody.stop !== '' ? [openaiBody.stop] : [])
@@ -1335,7 +1342,7 @@ async function usage(credential, displayName = DISPLAY_NAME) {
 
 const modelsOf = (table) => Object.fromEntries(table.map((m) => [slugOf(m.name) || m.id, {
   name: m.multiple !== undefined ? `${m.name} · x${m.multiple}` : m.name,
-  limit: { context: m.contextWindow, output: 8_192 },
+  limit: { context: m.contextWindow, output: DEFAULT_MAX_OUTPUT },
   tool_call: true,
 }]))
 
