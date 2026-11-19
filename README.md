@@ -32,6 +32,24 @@ magpie plugin add github:haijiaoye/magpie-accio-auth
 
 或在 magpie 的「插件 → 发现」里粘贴仓库地址。
 
+## 更新
+
+本插件从 GitHub 安装，magpie 会比对 `main` 分支的最新提交（最多每 10 分钟查一次），
+有新版本时「插件」页出现小红点、「已安装」显示「1 update」，点 **更新** 即可，或：
+
+```bash
+magpie plugin update
+```
+
+注意：
+
+- 安装地址**不要带 `#提交号`**（如 `#e5702f6`），固定提交的安装不会收到更新提示；
+  已这样装过的，重新执行上面的安装命令即可。
+- 带标签安装（如 `#v0.2.3`）只会在该标签变化时提示，不跟随 `main`。
+- 从固定提交换回无 `#` 地址后，如发现 Accio 供应商被关闭、模型勾选被重置，
+  执行 `magpie provider on accio`（国际版为 `accio-global`）并重新勾选模型。
+- 各版本改动见 [Releases](https://github.com/haijiaoye/magpie-accio-auth/releases)。
+
 ## 使用
 
 1. magpie 左侧 **供应商** → 选 **Accio (阿里)**（国内）或 **Accio 国际版** → 登录。
